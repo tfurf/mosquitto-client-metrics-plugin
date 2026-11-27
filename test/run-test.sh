@@ -19,7 +19,7 @@ x() { docker exec "$NAME" "$@"; }
 xd() { docker exec -d "$NAME" "$@"; }
 
 # Offline persistent session: subscribe once (QoS1, clean session off), then leave.
-x mosquitto_sub -i offline-client -c -q 1 -t 'test/#' -E
+x mosquitto_sub -i disconnected-client -c -q 1 -t 'test/#' -E
 # Healthy consumer.
 xd mosquitto_sub -i fast-client -q 1 -t 'test/#'
 # Stalled consumer: subscribes then gets frozen, never PUBACKs.
@@ -38,7 +38,7 @@ get() { x mosquitto_sub -t "\$SYS/broker/client-metrics/$1" -C 1 -W 3; }
 sysdropped=$(x mosquitto_sub -t "\$SYS/broker/publish/messages/dropped" -C 1 -W 3)
 
 echo "--- per-client metrics ---"
-for c in fast-client slow-client offline-client keepalive-client publisher; do
+for c in fast-client slow-client disconnected-client keepalive-client publisher; do
 	echo "$c: $(get clients/$c)"
 done
 echo "--- summary ---"
@@ -63,9 +63,9 @@ check slow-client queues out_inflight 10
 check slow-client queues out_queued 60
 check slow-client totals dropped $((N - 70))
 # Offline persistent session: only max_queued_messages (50) are kept.
-check offline-client totals routed_offline $N
-check offline-client queues out_queued 50
-check offline-client totals dropped_offline $((N - 50))
+check disconnected-client totals routed_disconnected $N
+check disconnected-client queues out_queued 50
+check disconnected-client totals dropped_disconnected $((N - 50))
 check keepalive-client disconnect_reasons keepalive_timeout 1
 check publisher totals msgs_in $N
 
@@ -78,18 +78,18 @@ x sh -c "kill -STOP \$(pgrep -f '^mosquitto_sub -i qos0-client ')"
 x sh -c 'head -c 65536 /dev/urandom > /tmp/big.bin && mosquitto_pub -i bigpub -q 0 -t big/data -f /tmp/big.bin --repeat 400'
 # Reconnect the persistent session: it should receive its 50 queued messages,
 # with no new routings or drops counted.
-x mosquitto_sub -i offline-client -c -q 1 -t 'test/#' -C 50 -W 5 >/dev/null
+x mosquitto_sub -i disconnected-client -c -q 1 -t 'test/#' -C 50 -W 5 >/dev/null
 sleep 3
 sysdropped=$(x mosquitto_sub -t "\$SYS/broker/publish/messages/dropped" -C 1 -W 3)
 q0=$(get clients/qos0-client | python3 -c "import json,sys; print(json.load(sys.stdin)['totals']['dropped'])")
 echo "qos0-client: $(get clients/qos0-client | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['totals'], d['queues'])")"
 if [ "$q0" -gt 0 ]; then echo "PASS qos0-client dropped=$q0 (>0)"; else echo "FAIL qos0-client dropped=$q0"; fail=1; fi
-check offline-client totals routed_offline $N
-check offline-client totals routed 0
-check offline-client totals msgs_out 50
-check offline-client totals dropped 0
-check offline-client totals dropped_offline $((N - 50))
-check offline-client totals connects 2
+check disconnected-client totals routed_disconnected $N
+check disconnected-client totals routed 0
+check disconnected-client totals msgs_out 50
+check disconnected-client totals dropped 0
+check disconnected-client totals dropped_disconnected $((N - 50))
+check disconnected-client totals connects 2
 
 total=$(( (N - 70) + (N - 50) + q0 ))
 if [ "$sysdropped" = "$total" ]; then echo "PASS broker global \$SYS dropped=$sysdropped == sum of per-client drops"; else echo "FAIL broker global dropped=$sysdropped, expected $total"; fail=1; fi
@@ -133,7 +133,7 @@ case "$(label title)" in mosquitto-client-metrics) ;; *) echo "FAIL title overri
 echo "--- phase 6: topic tree mirrors JSON (plugin_opt_format both) ---"
 # All retained topics under <base>/# must be exactly the flattened JSON at
 # <base>: same paths, same values, nothing stale (e.g. connected_for_s of a
-# client that went offline). null => no retained topic.
+# client that disconnected). null => no retained topic.
 tree_matches_json() { # base topic
 	x mosquitto_sub -t "$1" -t "$1/#" -v -W 2 2>/dev/null | python3 -c "
 import json, sys
@@ -160,7 +160,7 @@ if want != topics:
 print(len(topics), 'topics')
 " "$1"
 }
-for t in clients/fast-client clients/slow-client clients/offline-client clients/keepalive-client clients/publisher summary; do
+for t in clients/fast-client clients/slow-client clients/disconnected-client clients/keepalive-client clients/publisher summary; do
 	if out=$(tree_matches_json "\$SYS/broker/client-metrics/$t"); then echo "PASS $t: $out match JSON"; else echo "FAIL $t topic tree != JSON:"; echo "$out"; fail=1; fi
 done
 
@@ -177,6 +177,15 @@ if [ "$v" = "2 1" ]; then echo "PASS published at QoS 2, retained"; else echo "F
 bools=$(x mosquitto_sub -t "\$SYS/broker/client-metrics/#" -W 2 -F '%t %p' 2>/dev/null | grep -E ' (true|false)$' || true)
 if [ -z "$bools" ]; then echo "PASS no true/false values"; else echo "FAIL boolean values: $bools"; fail=1; fi
 check slow-client connection state 1
+# Mosquitto says connected/disconnected, never online/offline.
+names=$(x mosquitto_sub -t "\$SYS/broker/client-metrics/#" -W 2 -F '%t' 2>/dev/null | grep -Ei 'online|offline' || true)
+if [ -z "$names" ]; then echo "PASS no online/offline in topic names"; else echo "FAIL online/offline in topic names: $names"; fail=1; fi
+v=$(x mosquitto_sub -t "\$SYS/broker/client-metrics/summary/clients_connected" -C 1 -W 2 || true)
+if [ -n "$v" ]; then echo "PASS summary/clients_connected=$v"; else echo "FAIL summary/clients_connected missing"; fail=1; fi
+v=$(x mosquitto_sub -t "\$SYS/broker/client-metrics/clients/keepalive-client/connection/disconnected_for_s" -C 1 -W 2 || true)
+if [ -n "$v" ]; then echo "PASS keepalive-client connection/disconnected_for_s=$v"; else echo "FAIL connection/disconnected_for_s missing"; fail=1; fi
+if docker logs "$NAME" 2>&1 | grep -q 'client slow-client (connected) dropped'; then echo "PASS drop log says (connected)"; else echo "FAIL drop log wording"; fail=1; fi
+if docker logs "$NAME" 2>&1 | grep -q 'client disconnected-client (disconnected) dropped'; then echo "PASS drop log says (disconnected)"; else echo "FAIL drop log wording for disconnected client"; fail=1; fi
 check keepalive-client connection state 0
 
 echo "--- phase 8: default format is topics only; state is immediate ---"

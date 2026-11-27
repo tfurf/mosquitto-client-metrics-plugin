@@ -33,7 +33,8 @@
  * Plugin options (all optional):
  *   plugin_opt_topic_prefix       default "$SYS/broker/client-metrics"
  *   plugin_opt_interval           publish interval in seconds, default 10
- *   plugin_opt_offline_retention  seconds to keep offline clients, default 3600
+ *   plugin_opt_disconnected_retention  seconds to keep disconnected clients,
+ *                                 default 3600
  *   plugin_opt_retain             "true"/"false", default true
  *   plugin_opt_summary_top        number of clients in summary, default 10
  *   plugin_opt_log_drops          "true"/"false", log clients that dropped
@@ -154,12 +155,12 @@ struct counters {
 	uint64_t bytes_in;
 	uint64_t msgs_out;
 	uint64_t bytes_out;
-	uint64_t routed;          /* routed to client while it was online */
-	uint64_t routed_offline;  /* routed to client while it was offline */
-	uint64_t deferred;        /* routed while online but not written immediately */
+	uint64_t routed;          /* routed to client while connected */
+	uint64_t routed_disconnected;  /* routed while disconnected */
+	uint64_t deferred;        /* routed while connected, not written immediately */
 	uint64_t dropped;         /* [internals] broker discarded (limits reached) */
-	uint64_t dropped_offline; /* [internals] discarded while offline (queue full) */
-	uint64_t skipped_offline; /* [internals] not queued while offline (QoS 0) */
+	uint64_t dropped_disconnected; /* [internals] discarded while disconnected (queue full) */
+	uint64_t skipped_disconnected; /* [internals] not queued while disconnected (QoS 0) */
 	uint64_t disconnects;
 	uint64_t connects;
 };
@@ -171,14 +172,14 @@ struct client_entry {
 	char *address;
 	int protocol_version;
 	int keepalive;
-	bool online;
+	bool connected;
 	bool dirty;               /* changed since last publish */
 	bool published;           /* has a retained message out there */
 	char *leaves;             /* leaf topics published last time ('\0'-separated) */
 	size_t leaves_len;
 	time_t first_seen;
 	time_t connected_at;
-	time_t offline_since;
+	time_t disconnected_since;
 	int last_reason;          /* raw MOSQ_ERR_* code of last disconnect */
 	uint64_t dc[DC_COUNT];
 	struct counters c;
@@ -189,7 +190,7 @@ struct client_entry {
 /* A message routing in progress: set on ACL READ, resolved on the next event. */
 struct pending_route {
 	bool active;
-	bool online;
+	bool connected;
 	bool out_seen;
 	uint8_t qos;
 	struct mosquitto *ctx;
@@ -206,7 +207,7 @@ struct plugin_data {
 	char *prefix;
 	char *summary_topic;
 	int interval;
-	int offline_retention;
+	int disconnected_retention;
 	int summary_top;
 	bool retain;
 	bool log_drops;
@@ -441,7 +442,7 @@ static void pending_resolve(void)
 	}
 
 	e->dirty = true;
-	if(p->online){
+	if(p->connected){
 		e->c.deferred++;
 	}
 
@@ -453,12 +454,12 @@ static void pending_resolve(void)
 		 * accepts a message for this client (inflight or queued). If it did
 		 * not move, the message was not accepted. */
 		if(p->ctx->last_cmsg_id == p->cmsg_before){
-			if(p->online){
+			if(p->connected){
 				e->c.dropped++;
 			}else if(p->qos > 0 && p->ctx->is_dropping){
-				e->c.dropped_offline++;
+				e->c.dropped_disconnected++;
 			}else{
-				e->c.skipped_offline++;
+				e->c.skipped_disconnected++;
 			}
 		}
 	}
@@ -492,22 +493,22 @@ static int cb_acl_check(int event, void *event_data, void *userdata)
 		/* On reconnect the broker re-checks ACLs on already-queued messages
 		 * before the CONNECT event fires; the socket is already open then.
 		 * Those are not new routings, so ignore them. */
-		if(!e->online && ed->client->sock != INVALID_SOCKET){
+		if(!e->connected && ed->client->sock != INVALID_SOCKET){
 			return MOSQ_ERR_PLUGIN_IGNORE;
 		}
 	}
 #endif
 
 	e->dirty = true;
-	if(e->online){
+	if(e->connected){
 		e->c.routed++;
 	}else{
-		e->c.routed_offline++;
+		e->c.routed_disconnected++;
 	}
 
 	struct pending_route *p = &g_data->pending;
 	p->active = true;
-	p->online = e->online;
+	p->connected = e->connected;
 	p->out_seen = false;
 	p->qos = ed->qos;
 	p->ctx = ed->client;
@@ -596,10 +597,10 @@ static int cb_connect(int event, void *event_data, void *userdata)
 	if(!e){
 		return MOSQ_ERR_SUCCESS;
 	}
-	e->online = true;
+	e->connected = true;
 	e->dirty = true;
 	e->connected_at = time(NULL);
-	e->offline_since = 0;
+	e->disconnected_since = 0;
 	e->c.connects++;
 	e->protocol_version = mosquitto_client_protocol_version(ed->client);
 	e->keepalive = mosquitto_client_keepalive(ed->client);
@@ -609,7 +610,7 @@ static int cb_connect(int event, void *event_data, void *userdata)
 	return MOSQ_ERR_SUCCESS;
 }
 
-static void handle_offline(struct mosquitto *ctx, int reason)
+static void handle_disconnected(struct mosquitto *ctx, int reason)
 {
 	struct client_entry *e;
 
@@ -619,7 +620,7 @@ static void handle_offline(struct mosquitto *ctx, int reason)
 	if(!e){
 		return;
 	}
-	/* Session takeover: the old connection's offline event arrives after the
+	/* Session takeover: the old connection's disconnect event arrives after the
 	 * new connection is already registered under the same id. Only count it. */
 	enum dc_reason r = classify_reason(reason);
 	e->dc[r]++;
@@ -627,8 +628,8 @@ static void handle_offline(struct mosquitto *ctx, int reason)
 	e->last_reason = reason;
 	e->dirty = true;
 	if(r != DC_TAKEN_OVER){
-		e->online = false;
-		e->offline_since = time(NULL);
+		e->connected = false;
+		e->disconnected_since = time(NULL);
 		publish_state(e);
 	}
 }
@@ -638,7 +639,7 @@ static int cb_disconnect(int event, void *event_data, void *userdata)
 	struct mosquitto_evt_disconnect *ed = event_data;
 	UNUSED(event);
 	UNUSED(userdata);
-	handle_offline(ed->client, ed->reason);
+	handle_disconnected(ed->client, ed->reason);
 	return MOSQ_ERR_SUCCESS;
 }
 
@@ -647,7 +648,7 @@ static int cb_client_offline(int event, void *event_data, void *userdata)
 	struct mosquitto_evt_client_offline *ed = event_data;
 	UNUSED(event);
 	UNUSED(userdata);
-	handle_offline(ed->client, ed->reason);
+	handle_disconnected(ed->client, ed->reason);
 	return MOSQ_ERR_SUCCESS;
 }
 
@@ -874,7 +875,7 @@ static bool em_finish(struct emitter *em, char **leaves, size_t *leaves_len)
  * moment it changes rather than at the next interval. */
 static void publish_state(struct client_entry *e)
 {
-	const char *v = e->online ? "1" : "0";
+	const char *v = e->connected ? "1" : "0";
 
 	if(!(g_data->format & FMT_TOPICS)){
 		return;
@@ -897,14 +898,14 @@ static void publish_client(struct client_entry *e, time_t now)
 	em_i64(&em, "timestamp", (long long)now);
 
 	em_open(&em, "connection", false);
-	em_bool(&em, "state", e->online);
+	em_bool(&em, "state", e->connected);
 	em_str(&em, "address", e->address);
 	em_i64(&em, "protocol_version", e->protocol_version);
 	em_i64(&em, "keepalive", e->keepalive);
-	if(e->online){
+	if(e->connected){
 		em_i64(&em, "connected_for_s", (long long)(now - e->connected_at));
-	}else if(e->offline_since){
-		em_i64(&em, "offline_for_s", (long long)(now - e->offline_since));
+	}else if(e->disconnected_since){
+		em_i64(&em, "disconnected_for_s", (long long)(now - e->disconnected_since));
 	}
 	if(e->last_reason >= 0){
 		em_open(&em, "last_disconnect", false);
@@ -922,13 +923,13 @@ static void publish_client(struct client_entry *e, time_t now)
 	em_u64(&em, "msgs_out", e->c.msgs_out);
 	em_u64(&em, "bytes_out", e->c.bytes_out);
 	em_u64(&em, "routed", e->c.routed);
-	em_u64(&em, "routed_offline", e->c.routed_offline);
+	em_u64(&em, "routed_disconnected", e->c.routed_disconnected);
 	em_u64(&em, "deferred", e->c.deferred);
 #ifdef CM_WITH_INTERNALS
 	if(internals_ok()){
 		em_u64(&em, "dropped", e->c.dropped);
-		em_u64(&em, "dropped_offline", e->c.dropped_offline);
-		em_u64(&em, "skipped_offline_qos0", e->c.skipped_offline);
+		em_u64(&em, "dropped_disconnected", e->c.dropped_disconnected);
+		em_u64(&em, "skipped_disconnected_qos0", e->c.skipped_disconnected);
 	}
 #endif
 	em_close(&em);
@@ -943,7 +944,7 @@ static void publish_client(struct client_entry *e, time_t now)
 #ifdef CM_WITH_INTERNALS
 	if(internals_ok()){
 		em_u64(&em, "dropped", D(dropped));
-		em_u64(&em, "dropped_offline", D(dropped_offline));
+		em_u64(&em, "dropped_disconnected", D(dropped_disconnected));
 	}
 #endif
 	em_close(&em);
@@ -985,7 +986,7 @@ static uint64_t loss_score(const struct client_entry *e)
 {
 #ifdef CM_WITH_INTERNALS
 	if(internals_ok()){
-		return e->c.dropped + e->c.dropped_offline;
+		return e->c.dropped + e->c.dropped_disconnected;
 	}
 #endif
 	return e->c.deferred;
@@ -1012,7 +1013,7 @@ static void publish_summary(time_t now)
 {
 	struct client_entry *e, *tmp;
 	unsigned count = HASH_COUNT(g_data->clients);
-	unsigned online = 0;
+	unsigned connected = 0;
 	uint64_t routed = 0, deferred = 0, dropped = 0, keepalive = 0, lost = 0;
 	struct client_entry **arr = NULL;
 	unsigned n = 0;
@@ -1021,10 +1022,10 @@ static void publish_summary(time_t now)
 		arr = calloc(count, sizeof(*arr));
 	}
 	HASH_ITER(hh, g_data->clients, e, tmp){
-		online += e->online;
+		connected += e->connected;
 		routed += e->c.routed;
 		deferred += e->c.deferred;
-		dropped += e->c.dropped + e->c.dropped_offline;
+		dropped += e->c.dropped + e->c.dropped_disconnected;
 		keepalive += e->dc[DC_KEEPALIVE];
 		lost += e->dc[DC_CONN_LOST];
 		if(arr && (loss_score(e) > 0 || abnormal_disconnects(e) > 0)){
@@ -1045,7 +1046,7 @@ static void publish_summary(time_t now)
 	em_bool(&em, "exact_drop_counts", false);
 #endif
 	em_u64(&em, "clients_tracked", count);
-	em_u64(&em, "clients_online", online);
+	em_u64(&em, "clients_connected", connected);
 	em_u64(&em, "routed", routed);
 	em_u64(&em, "deferred", deferred);
 #ifdef CM_WITH_INTERNALS
@@ -1062,14 +1063,14 @@ static void publish_summary(time_t now)
 		snprintf(idx, sizeof(idx), "%u", i);
 		em_open(&em, idx, false);
 		em_str(&em, "client_id", e->id);
-		em_bool(&em, "connection_state", e->online);
+		em_bool(&em, "connection_state", e->connected);
 		em_u64(&em, "deferred", e->c.deferred);
 		em_u64(&em, "keepalive_timeouts", e->dc[DC_KEEPALIVE]);
 		em_u64(&em, "conn_lost", e->dc[DC_CONN_LOST]);
 #ifdef CM_WITH_INTERNALS
 		if(internals_ok()){
 			em_u64(&em, "dropped", e->c.dropped);
-			em_u64(&em, "dropped_offline", e->c.dropped_offline);
+			em_u64(&em, "dropped_disconnected", e->c.dropped_disconnected);
 		}
 #endif
 		em_close(&em);
@@ -1085,10 +1086,10 @@ static void publish_all(time_t now)
 	struct client_entry *e, *tmp;
 
 	HASH_ITER(hh, g_data->clients, e, tmp){
-		/* Expire long-offline clients and clear their retained topic. */
-		if(!e->online && e->offline_since
-				&& g_data->offline_retention >= 0
-				&& now - e->offline_since > g_data->offline_retention){
+		/* Expire long-disconnected clients and clear their retained topics. */
+		if(!e->connected && e->disconnected_since
+				&& g_data->disconnected_retention >= 0
+				&& now - e->disconnected_since > g_data->disconnected_retention){
 			if(e->published && g_data->retain){
 				if(g_data->format & FMT_JSON){
 					mosquitto_broker_publish_copy(NULL, e->topic, 0, NULL, 0, true, NULL);
@@ -1106,8 +1107,8 @@ static void publish_all(time_t now)
 
 #ifdef CM_WITH_INTERNALS
 		/* Queue depth can change without any event we count, so always
-		 * publish online clients when internals are available. */
-		if(internals_ok() && e->online){
+		 * publish connected clients when internals are available. */
+		if(internals_ok() && e->connected){
 			e->dirty = true;
 		}
 #endif
@@ -1116,7 +1117,7 @@ static void publish_all(time_t now)
 			uint64_t drops = 0;
 #ifdef CM_WITH_INTERNALS
 			if(internals_ok()){
-				drops = D(dropped) + D(dropped_offline);
+				drops = D(dropped) + D(dropped_disconnected);
 				dropped_now = drops > 0;
 			}
 #endif
@@ -1124,8 +1125,8 @@ static void publish_all(time_t now)
 				mosquitto_log_printf(MOSQ_LOG_NOTICE,
 						PLUGIN_NAME ": client %s (%s) dropped %" PRIu64 " messages in the last %d s "
 						"(routed %" PRIu64 ", sent %" PRIu64 ").",
-						e->id, e->online ? "online" : "offline", drops, g_data->interval,
-						D(routed) + D(routed_offline), D(msgs_out));
+						e->id, e->connected ? "connected" : "disconnected", drops, g_data->interval,
+						D(routed) + D(routed_disconnected), D(msgs_out));
 			}
 			publish_client(e, now);
 			e->prev = e->c;
@@ -1222,7 +1223,7 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata, st
 	}
 	d->pid = identifier;
 	d->interval = 10;
-	d->offline_retention = 3600;
+	d->disconnected_retention = 3600;
 	d->summary_top = 10;
 	d->retain = true;
 	d->log_drops = true;
@@ -1237,8 +1238,8 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata, st
 			ok = v[0] != '\0' && !strpbrk(v, "+#");
 		}else if(!strcmp(k, "interval")){
 			ok = parse_int(v, 1, &d->interval);
-		}else if(!strcmp(k, "offline_retention")){
-			ok = parse_int(v, 0, &d->offline_retention);
+		}else if(!strcmp(k, "disconnected_retention")){
+			ok = parse_int(v, 0, &d->disconnected_retention);
 		}else if(!strcmp(k, "summary_top")){
 			ok = parse_int(v, 0, &d->summary_top);
 		}else if(!strcmp(k, "retain")){

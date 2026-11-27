@@ -7,7 +7,7 @@ For every client id it reports:
 
 | Area | Metrics |
 |---|---|
-| Message loss | `dropped` (broker discarded the message, online), `dropped_offline` (persistent-session queue full), `deferred` (not written immediately: queued or dropped) |
+| Message loss | `dropped` (broker discarded the message while the client was connected), `dropped_disconnected` (persistent-session queue full), `deferred` (not written immediately: queued or dropped) |
 | Backpressure | outgoing inflight / queued counts and bytes, `socket_packets_pending` (packets the broker can't write to the client's socket yet), `dropping` flag |
 | Traffic | `msgs_in`/`bytes_in` (published by the client), `msgs_out`/`bytes_out` (sent to it), `routed` (messages the broker tried to deliver to it) |
 | Connection health | connects, disconnects broken down by reason: `keepalive_timeout`, `conn_lost`, `protocol_error`, `session_taken_over`, `administrative`, `auth`, `clean` |
@@ -31,7 +31,7 @@ $SYS/broker/client-metrics/clients/slow-client/connection/state     1
 $SYS/broker/client-metrics/clients/slow-client/totals/dropped       430
 $SYS/broker/client-metrics/clients/slow-client/queues/out_queued    60
 $SYS/broker/client-metrics/clients/slow-client/disconnect_reasons/keepalive_timeout 0
-$SYS/broker/client-metrics/summary/clients_online                   3
+$SYS/broker/client-metrics/summary/clients_connected                3
 $SYS/broker/client-metrics/summary/worst_clients/0/client_id        slow-client
 ```
 
@@ -53,12 +53,12 @@ Layout:
   `both` publishes both. JSON documents are republished every interval. A JSON
   `null` (e.g. no username) has no topic.
 * Values that stop applying are cleared, for example `connected_for_s` once a
-  client goes offline.
+  client disconnects.
 
 The broker also logs a NOTICE line whenever a client drops messages:
 
 ```
-client-metrics: client slow-client (online) dropped 430 messages in the last 10 s (routed 500, sent 10).
+client-metrics: client slow-client (connected) dropped 430 messages in the last 10 s (routed 500, sent 10).
 ```
 
 ## Reading the numbers
@@ -67,7 +67,7 @@ client-metrics: client slow-client (online) dropped 430 messages in the last 10 
 |---|---|
 | `dropped` > 0, `out_inflight` = `out_inflight_max`, `out_queued` full | The client is too slow to acknowledge QoS 1/2. It's a slow consumer, or its acks are being lost. |
 | `dropped` > 0 with high `socket_packets_pending` | The broker can't write to the socket fast enough: TCP backpressure, a slow link, or a stalled client. QoS 0 drops happen this way. |
-| `dropped_offline` > 0 | A persistent session overflowed `max_queued_messages` while the client was disconnected. |
+| `dropped_disconnected` > 0 | A persistent session overflowed `max_queued_messages` while the client was disconnected. |
 | `keepalive_timeout` / `conn_lost` disconnects climbing | The network path is losing packets or the client is hanging. |
 | `routed` ≫ `msgs_out` without drops | Messages are still queued, waiting for the client. |
 
@@ -83,7 +83,7 @@ plugin /usr/lib/mosquitto_client_metrics.so
 plugin_opt_interval 10                       # seconds between publishes (default 10)
 plugin_opt_topic_prefix $SYS/broker/client-metrics  # default
 plugin_opt_format topics                     # topics (default), json or both
-plugin_opt_offline_retention 3600            # forget clients offline this long, clearing their retained topic
+plugin_opt_disconnected_retention 3600       # forget clients disconnected this long, clearing their retained topics
 plugin_opt_retain true                       # publish metrics retained
 plugin_opt_summary_top 10                    # clients listed in summary
 plugin_opt_log_drops true                    # NOTICE log line per dropping client
@@ -167,7 +167,7 @@ test/run-test.sh
 
 The test uses tiny limits (`test/mosquitto-test.conf`) and creates these clients:
 a healthy subscriber, a frozen QoS 1 subscriber, a frozen QoS 0 subscriber
-getting 64 KB messages, an offline persistent session (which then reconnects),
+getting 64 KB messages, a disconnected persistent session (which then reconnects),
 and a client that hits a keepalive timeout. It checks each client's exact
 numbers. It also checks that the per-client drops add up to the broker's own
 global `$SYS/broker/publish/messages/dropped`. That broker runs with
