@@ -34,7 +34,7 @@ done
 x mosquitto_pub -i publisher -q 1 -t test/data -m hello --repeat $N
 sleep 9   # > 1.5 x keepalive (7.5 s), and > publish interval
 
-get() { x mosquitto_sub -t "\$SYS/client-metrics/$1" -C 1 -W 3; }
+get() { x mosquitto_sub -t "\$SYS/broker/client-metrics/$1" -C 1 -W 3; }
 sysdropped=$(x mosquitto_sub -t "\$SYS/broker/publish/messages/dropped" -C 1 -W 3)
 
 echo "--- per-client metrics ---"
@@ -116,7 +116,7 @@ sleep 3  # > plugin_opt_interval
 if docker logs "$NAME_OFF" 2>&1 | grep -q 'client-metrics.*disabled'; then echo "PASS disabled plugin logged it"; else echo "FAIL no 'disabled' log line"; fail=1; fi
 regs=$(docker logs "$NAME_OFF" 2>&1 | grep -c 'client-metrics has registered' || true)
 if [ "$regs" = 0 ]; then echo "PASS disabled plugin registered no callbacks"; else echo "FAIL disabled plugin registered $regs callbacks"; fail=1; fi
-pubs=$(docker exec "$NAME_OFF" mosquitto_sub -t "\$SYS/client-metrics/#" -C 1 -W 3 || true)
+pubs=$(docker exec "$NAME_OFF" mosquitto_sub -t "\$SYS/broker/client-metrics/#" -C 1 -W 3 || true)
 if [ -z "$pubs" ]; then echo "PASS disabled plugin publishes nothing"; else echo "FAIL disabled plugin published: $pubs"; fail=1; fi
 
 echo "--- phase 5: OCI image annotations ---"
@@ -161,21 +161,42 @@ print(len(topics), 'topics')
 " "$1"
 }
 for t in clients/fast-client clients/slow-client clients/offline-client clients/keepalive-client clients/publisher summary; do
-	if out=$(tree_matches_json "\$SYS/client-metrics/$t"); then echo "PASS $t: $out match JSON"; else echo "FAIL $t topic tree != JSON:"; echo "$out"; fail=1; fi
+	if out=$(tree_matches_json "\$SYS/broker/client-metrics/$t"); then echo "PASS $t: $out match JSON"; else echo "FAIL $t topic tree != JSON:"; echo "$out"; fail=1; fi
 done
 
-echo "--- phase 7: default format is topics only ---"
+echo "--- phase 7: Mosquitto \$SYS conventions ---"
+# Like \$SYS: values only republished when they change. fast-client is idle, so
+# over two intervals only its clock-driven values may update. (The JSON
+# document at the parent topic is excluded: it always carries a new timestamp.)
+changed=$(x mosquitto_sub -t "\$SYS/broker/client-metrics/clients/fast-client/#" -v -R -W 5 2>/dev/null | cut -d' ' -f1 | grep '/fast-client/' | sort -u | sed 's|.*/clients/fast-client/||' | tr '\n' ' ' || true)
+if [ "$changed" = "connection/connected_for_s timestamp " ]; then echo "PASS idle client only republished: $changed"; else echo "FAIL idle client republished: '$changed'"; fail=1; fi
+# Like \$SYS: retained, QoS 2.
+v=$(x mosquitto_sub -q 2 -t "\$SYS/broker/client-metrics/clients/fast-client/totals/connects" -C 1 -W 3 -F '%q %r' || true)
+if [ "$v" = "2 1" ]; then echo "PASS published at QoS 2, retained"; else echo "FAIL qos/retain='$v' (expected '2 1')"; fail=1; fi
+# Like \$SYS and connection state topics: booleans are 1/0.
+bools=$(x mosquitto_sub -t "\$SYS/broker/client-metrics/#" -W 2 -F '%t %p' 2>/dev/null | grep -E ' (true|false)$' || true)
+if [ -z "$bools" ]; then echo "PASS no true/false values"; else echo "FAIL boolean values: $bools"; fail=1; fi
+check slow-client connection state 1
+check keepalive-client connection state 0
+
+echo "--- phase 8: default format is topics only; state is immediate ---"
+# Interval 8 s: state must change well before the first periodic publish.
 docker run -d --name "$NAME_TOPICS" -v "$HERE/mosquitto-topics.conf:/mosquitto/config/mosquitto.conf:ro" "$IMAGE" >/dev/null
 sleep 1
+tx() { docker exec "$NAME_TOPICS" mosquitto_sub -t "\$SYS/broker/client-metrics/$1" -C 1 -W 2 2>/dev/null || true; }
 docker exec -d "$NAME_TOPICS" mosquitto_sub -i topics-sub -t 'test/#'
-sleep 3  # > plugin_opt_interval
-tx() { docker exec "$NAME_TOPICS" mosquitto_sub -t "\$SYS/client-metrics/$1" -C 1 -W 2 2>/dev/null || true; }
-v=$(tx clients/topics-sub/online)
-if [ "$v" = true ]; then echo "PASS clients/topics-sub/online=true"; else echo "FAIL clients/topics-sub/online='$v'"; fail=1; fi
+sleep 1
+v=$(tx clients/topics-sub/connection/state)
+if [ "$v" = 1 ]; then echo "PASS connection/state=1 immediately on connect"; else echo "FAIL connection/state='$v' after connect"; fail=1; fi
+docker exec "$NAME_TOPICS" sh -c "kill \$(pgrep -f '^mosquitto_sub -i topics-sub ')"
+sleep 1
+v=$(tx clients/topics-sub/connection/state)
+if [ "$v" = 0 ]; then echo "PASS connection/state=0 immediately on disconnect"; else echo "FAIL connection/state='$v' after disconnect"; fail=1; fi
+sleep 6  # past the first periodic publish
 v=$(tx clients/topics-sub/totals/connects)
 if [ "$v" = 1 ]; then echo "PASS clients/topics-sub/totals/connects=1"; else echo "FAIL clients/topics-sub/totals/connects='$v'"; fail=1; fi
-v=$(tx summary/clients_online)
-if [ -n "$v" ]; then echo "PASS summary/clients_online=$v"; else echo "FAIL summary/clients_online missing"; fail=1; fi
+v=$(tx summary/clients_tracked)
+if [ -n "$v" ]; then echo "PASS summary/clients_tracked=$v"; else echo "FAIL summary/clients_tracked missing"; fail=1; fi
 v=$(tx clients/topics-sub)$(tx summary)
 if [ -z "$v" ]; then echo "PASS no JSON documents in topics mode"; else echo "FAIL JSON published in topics mode: $v"; fail=1; fi
 

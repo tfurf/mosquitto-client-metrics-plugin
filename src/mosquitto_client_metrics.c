@@ -26,9 +26,12 @@
  * as one retained topic per value (e.g. .../clients/<id>/totals/dropped),
  * as a JSON document at the base topic, or both. The topic tree mirrors the
  * JSON structure exactly; array elements use their index as the topic level.
+ * Topics follow Mosquitto's $SYS conventions: flags are 1/0, messages are
+ * retained at QoS 2, values are only republished when they change, and
+ * connection/state is published immediately on connect/disconnect.
  *
  * Plugin options (all optional):
- *   plugin_opt_topic_prefix       default "$SYS/client-metrics"
+ *   plugin_opt_topic_prefix       default "$SYS/broker/client-metrics"
  *   plugin_opt_interval           publish interval in seconds, default 10
  *   plugin_opt_offline_retention  seconds to keep offline clients, default 3600
  *   plugin_opt_retain             "true"/"false", default true
@@ -573,6 +576,8 @@ static int cb_message_in(int event, void *event_data, void *userdata)
 	return MOSQ_ERR_SUCCESS;
 }
 
+static void publish_state(struct client_entry *e);
+
 static int cb_connect(int event, void *event_data, void *userdata)
 {
 	struct mosquitto_evt_connect *ed = event_data;
@@ -600,6 +605,7 @@ static int cb_connect(int event, void *event_data, void *userdata)
 	e->keepalive = mosquitto_client_keepalive(ed->client);
 	replace_str(&e->username, mosquitto_client_username(ed->client));
 	replace_str(&e->address, mosquitto_client_address(ed->client));
+	publish_state(e);
 	return MOSQ_ERR_SUCCESS;
 }
 
@@ -623,6 +629,7 @@ static void handle_offline(struct mosquitto *ctx, int reason)
 	if(r != DC_TAKEN_OVER){
 		e->online = false;
 		e->offline_since = time(NULL);
+		publish_state(e);
 	}
 }
 
@@ -663,7 +670,9 @@ struct emitter {
 	int mode;
 	const char *base;
 	struct buf json;
-	struct buf leaves;        /* '\0'-separated relative paths published */
+	struct buf leaves;        /* "path\0value\0" pairs emitted this run */
+	const char *old;          /* pairs from the previous run */
+	size_t old_len;
 	char rel[256];            /* relative path of the current object */
 	size_t rel_len[EM_MAX_DEPTH];
 	bool is_array[EM_MAX_DEPTH];
@@ -671,6 +680,9 @@ struct emitter {
 	int depth;
 	bool err;
 };
+
+/* Same as Mosquitto's own $SYS tree: QoS 2, retained (when enabled). */
+#define METRICS_QOS 2
 
 static void topic_publish(const char *base, const char *rel, const char *payload, bool retain)
 {
@@ -680,15 +692,32 @@ static void topic_publish(const char *base, const char *rel, const char *payload
 		return;
 	}
 	snprintf(topic, len, "%s/%s", base, rel);
-	mosquitto_broker_publish_copy(NULL, topic, (int)strlen(payload), payload, 0, retain, NULL);
+	mosquitto_broker_publish_copy(NULL, topic, (int)strlen(payload), payload, METRICS_QOS, retain, NULL);
 	free(topic);
 }
 
-static void em_begin(struct emitter *em, int mode, const char *base)
+/* Leaf lists are packed "path\0value\0" pairs. Returns the stored value
+ * for path, or NULL. */
+static char *leaves_find(char *list, size_t len, const char *path)
+{
+	for(size_t i = 0; list && i < len; ){
+		char *p = list + i;
+		char *v = p + strlen(p) + 1;
+		if(!strcmp(p, path)){
+			return v;
+		}
+		i = (size_t)(v + strlen(v) + 1 - list);
+	}
+	return NULL;
+}
+
+static void em_begin(struct emitter *em, int mode, const char *base, const char *old, size_t old_len)
 {
 	memset(em, 0, sizeof(*em));
 	em->mode = mode;
 	em->base = base;
+	em->old = old;
+	em->old_len = old_len;
 	em->first[0] = true;
 	if(mode & FMT_JSON){
 		buf_printf(&em->json, "{");
@@ -766,9 +795,13 @@ static void em_leaf(struct emitter *em, const char *key, const char *json_litera
 	if((em->mode & FMT_TOPICS) && value){
 		size_t saved = em_rel_push(em, key);
 		if(!em->err){
-			topic_publish(em->base, em->rel, value, g_data->retain);
-			buf_printf(&em->leaves, "%s", em->rel);
-			buf_printf(&em->leaves, "%c", '\0');
+			/* Like $SYS: only republish values that changed. Without
+			 * retain there is nothing to compare against. */
+			const char *prev = g_data->retain ? leaves_find((char *)em->old, em->old_len, em->rel) : NULL;
+			if(!prev || strcmp(prev, value)){
+				topic_publish(em->base, em->rel, value, g_data->retain);
+			}
+			buf_printf(&em->leaves, "%s%c%s%c", em->rel, '\0', value, '\0');
 		}
 		em->rel[saved] = '\0';
 	}
@@ -790,7 +823,8 @@ static void em_i64(struct emitter *em, const char *key, long long v)
 
 static void em_bool(struct emitter *em, const char *key, bool v)
 {
-	em_leaf(em, key, v ? "true" : "false", v ? "true" : "false");
+	/* Like $SYS and connection state topics: 1/0, also in JSON. */
+	em_leaf(em, key, v ? "1" : "0", v ? "1" : "0");
 }
 
 static void em_str(struct emitter *em, const char *key, const char *v)
@@ -798,23 +832,16 @@ static void em_str(struct emitter *em, const char *key, const char *v)
 	em_leaf(em, key, v ? NULL : "null", v);
 }
 
-static bool leaves_contain(const char *list, size_t len, const char *path)
-{
-	for(size_t i = 0; i < len; i += strlen(list + i) + 1){
-		if(!strcmp(list + i, path)){
-			return true;
-		}
-	}
-	return false;
-}
-
 /* Clear retained leaf topics published last time but not this time. */
-static void leaves_clear_stale(const char *base, const char *old, size_t old_len, const char *now, size_t now_len)
+static void leaves_clear_stale(const char *base, char *old, size_t old_len, char *now, size_t now_len)
 {
-	for(size_t i = 0; old && i < old_len; i += strlen(old + i) + 1){
-		if(!now || !leaves_contain(now, now_len, old + i)){
-			topic_publish(base, old + i, "", true);
+	for(size_t i = 0; old && i < old_len; ){
+		char *p = old + i;
+		char *v = p + strlen(p) + 1;
+		if(!leaves_find(now, now_len, p)){
+			topic_publish(base, p, "", true);
 		}
+		i = (size_t)(v + strlen(v) + 1 - old);
 	}
 }
 
@@ -828,7 +855,7 @@ static bool em_finish(struct emitter *em, char **leaves, size_t *leaves_len)
 		buf_printf(&em->json, "}");
 		ok = ok && !em->json.err;
 		if(ok){
-			mosquitto_broker_publish_copy(NULL, em->base, (int)em->json.len, em->json.s, 0, g_data->retain, NULL);
+			mosquitto_broker_publish_copy(NULL, em->base, (int)em->json.len, em->json.s, METRICS_QOS, g_data->retain, NULL);
 		}
 	}
 	if((em->mode & FMT_TOPICS) && g_data->retain && ok){
@@ -843,23 +870,49 @@ static bool em_finish(struct emitter *em, char **leaves, size_t *leaves_len)
 	return ok;
 }
 
+/* Like Mosquitto's bridge and connection-state topics, publish the state the
+ * moment it changes rather than at the next interval. */
+static void publish_state(struct client_entry *e)
+{
+	const char *v = e->online ? "1" : "0";
+
+	if(!(g_data->format & FMT_TOPICS)){
+		return;
+	}
+	topic_publish(e->topic, "connection/state", v, g_data->retain);
+	/* Keep the stored value in step so the next interval doesn't repeat it. */
+	char *stored = leaves_find(e->leaves, e->leaves_len, "connection/state");
+	if(stored && strlen(stored) == 1){
+		stored[0] = v[0];
+	}
+}
+
 static void publish_client(struct client_entry *e, time_t now)
 {
 	struct emitter em;
 
-	em_begin(&em, g_data->format, e->topic);
+	em_begin(&em, g_data->format, e->topic, e->leaves, e->leaves_len);
 	em_str(&em, "client_id", e->id);
 	em_str(&em, "username", e->username);
+	em_i64(&em, "timestamp", (long long)now);
+
+	em_open(&em, "connection", false);
+	em_bool(&em, "state", e->online);
 	em_str(&em, "address", e->address);
 	em_i64(&em, "protocol_version", e->protocol_version);
 	em_i64(&em, "keepalive", e->keepalive);
-	em_bool(&em, "online", e->online);
-	em_i64(&em, "timestamp", (long long)now);
 	if(e->online){
 		em_i64(&em, "connected_for_s", (long long)(now - e->connected_at));
 	}else if(e->offline_since){
 		em_i64(&em, "offline_for_s", (long long)(now - e->offline_since));
 	}
+	if(e->last_reason >= 0){
+		em_open(&em, "last_disconnect", false);
+		em_str(&em, "reason", dc_names[classify_reason(e->last_reason)]);
+		em_i64(&em, "code", e->last_reason);
+		em_close(&em);
+	}
+	em_close(&em);
 
 	em_open(&em, "totals", false);
 	em_u64(&em, "connects", e->c.connects);
@@ -900,12 +953,6 @@ static void publish_client(struct client_entry *e, time_t now)
 		em_u64(&em, dc_names[i], e->dc[i]);
 	}
 	em_close(&em);
-	if(e->last_reason >= 0){
-		em_open(&em, "last_disconnect", false);
-		em_str(&em, "reason", dc_names[classify_reason(e->last_reason)]);
-		em_i64(&em, "code", e->last_reason);
-		em_close(&em);
-	}
 
 #ifdef CM_WITH_INTERNALS
 	if(internals_ok()){
@@ -989,7 +1036,7 @@ static void publish_summary(time_t now)
 	}
 
 	struct emitter em;
-	em_begin(&em, g_data->format, g_data->summary_topic);
+	em_begin(&em, g_data->format, g_data->summary_topic, g_data->summary_leaves, g_data->summary_leaves_len);
 	em_i64(&em, "timestamp", (long long)now);
 	em_str(&em, "plugin_version", PLUGIN_VERSION);
 #ifdef CM_WITH_INTERNALS
@@ -1015,7 +1062,7 @@ static void publish_summary(time_t now)
 		snprintf(idx, sizeof(idx), "%u", i);
 		em_open(&em, idx, false);
 		em_str(&em, "client_id", e->id);
-		em_bool(&em, "online", e->online);
+		em_bool(&em, "connection_state", e->online);
 		em_u64(&em, "deferred", e->c.deferred);
 		em_u64(&em, "keepalive_timeouts", e->dc[DC_KEEPALIVE]);
 		em_u64(&em, "conn_lost", e->dc[DC_CONN_LOST]);
@@ -1162,7 +1209,7 @@ static void data_free(struct plugin_data *d)
 int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata, struct mosquitto_opt *opts, int opt_count)
 {
 	struct plugin_data *d;
-	const char *prefix = "$SYS/client-metrics";
+	const char *prefix = "$SYS/broker/client-metrics";
 
 	if(g_data){
 		mosquitto_log_printf(MOSQ_LOG_ERR, PLUGIN_NAME ": may only be loaded once (global plugin, not per listener).");

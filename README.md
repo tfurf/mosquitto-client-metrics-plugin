@@ -20,28 +20,38 @@ abnormal disconnects.
 
 ```sh
 docker compose up --build          # broker on :1883 with the plugin loaded
-mosquitto_sub -t '$SYS/client-metrics/#' -v
+mosquitto_sub -t '$SYS/broker/client-metrics/#' -v
 ```
 
 Each value is its own retained topic, so tools such as mqtt-exporter can read
 them directly:
 
 ```
-$SYS/client-metrics/clients/slow-client/online                  true
-$SYS/client-metrics/clients/slow-client/totals/dropped          430
-$SYS/client-metrics/clients/slow-client/queues/out_queued       60
-$SYS/client-metrics/clients/slow-client/disconnect_reasons/keepalive_timeout 0
-$SYS/client-metrics/summary/clients_online                      3
-$SYS/client-metrics/summary/worst_clients/0/client_id           slow-client
+$SYS/broker/client-metrics/clients/slow-client/connection/state     1
+$SYS/broker/client-metrics/clients/slow-client/totals/dropped       430
+$SYS/broker/client-metrics/clients/slow-client/queues/out_queued    60
+$SYS/broker/client-metrics/clients/slow-client/disconnect_reasons/keepalive_timeout 0
+$SYS/broker/client-metrics/summary/clients_online                   3
+$SYS/broker/client-metrics/summary/worst_clients/0/client_id        slow-client
 ```
 
+The topics follow Mosquitto's own `$SYS` conventions:
+* They live under `$SYS/broker/`.
+* Flags are `1`/`0`. `connection/state` matches Mosquitto's bridge and
+  connection-state topics.
+* Messages are retained and published at QoS 2.
+* A value is only republished when it changes. The exception is
+  `connection/state`, which is published the moment a client connects or
+  disconnects.
+
+Layout:
 * `…/clients/<client id>/…` holds per-client values. Any `+` or `#` in a client
   id is replaced with `_`.
 * `…/summary/…` holds broker totals and `worst_clients`, ranked from 0.
 * With `plugin_opt_format json`, each base topic (`…/clients/<id>`,
   `…/summary`) instead holds one JSON document with exactly this structure;
-  `both` publishes both. Booleans are `true`/`false`. A JSON `null` (e.g. no
-  username) has no topic.
+  `both` publishes both. JSON documents are republished every interval. A JSON
+  `null` (e.g. no username) has no topic.
 * Values that stop applying are cleared, for example `connected_for_s` once a
   client goes offline.
 
@@ -71,7 +81,7 @@ messages are dropped. It doesn't fix the client or link that's causing them.
 # Must be listed BEFORE any auth/ACL plugin (see Caveats).
 plugin /usr/lib/mosquitto_client_metrics.so
 plugin_opt_interval 10                       # seconds between publishes (default 10)
-plugin_opt_topic_prefix $SYS/client-metrics  # default
+plugin_opt_topic_prefix $SYS/broker/client-metrics  # default
 plugin_opt_format topics                     # topics (default), json or both
 plugin_opt_offline_retention 3600            # forget clients offline this long, clearing their retained topic
 plugin_opt_retain true                       # publish metrics retained
