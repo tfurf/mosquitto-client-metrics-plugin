@@ -23,3 +23,10 @@ test/run-test.sh                                                         # test 
 - The ACL callback must always return `MOSQ_ERR_PLUGIN_IGNORE`. It must never affect access decisions.
 - Never register for an event and return an error from it. Never block in callbacks: they run on the broker's only thread.
 - To bump Mosquitto, change `MOSQUITTO_VERSION`, `MOSQUITTO_SHA256` and `ALPINE_VERSION` together in `docker/Dockerfile` to match upstream `docker/2.1-alpine/Dockerfile`.
+
+## Git Flows
+
+- Use worktrees, commit in the worktree.
+- Do not push to any remotes.
+- Merge to main from worktrees will be performed by user, not agent.
+- When work is done, cleanup the worktrees (after assuring the changes have been incorporated in main).
