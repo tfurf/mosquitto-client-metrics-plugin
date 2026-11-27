@@ -95,7 +95,32 @@ accessors. If anything doesn't line up, it logs a warning and turns off
 
 Bump `MOSQUITTO_VERSION`, `MOSQUITTO_SHA256` and `ALPINE_VERSION` together in
 `docker/Dockerfile`. Match them to upstream's
-`docker/2.1-alpine/Dockerfile` for that release, then rerun the test.
+`docker/2.1-alpine/Dockerfile` for that release. Re-pin `ALPINE_DIGEST` and
+`MOSQUITTO_DIGEST` with `docker buildx imagetools inspect <image:tag>`, then
+rerun the test.
+
+### Building OCI images
+
+The Dockerfile only uses instructions from the OCI image spec, so any builder
+works. It sets the `org.opencontainers.image.*` labels, and the test checks them.
+Pass the per-build values as build args:
+
+```sh
+ARGS="--build-arg REVISION=$(git rev-parse HEAD) --build-arg CREATED=$(date -u +%FT%TZ) --build-arg SOURCE_URL=<repo url>"
+
+# Podman/Buildah: OCI format by default
+podman build $ARGS -f docker/Dockerfile -t mosquitto-client-metrics:2.1.4 .
+
+# Docker: the default store saves Docker media types. For OCI output, use a
+# docker-container builder (or the containerd image store):
+docker buildx create --name oci --driver docker-container
+docker buildx build --builder oci $ARGS -f docker/Dockerfile \
+  --output type=oci,dest=mosquitto-client-metrics.oci.tar .
+# or push: --output type=image,name=<registry>/mosquitto-client-metrics:2.1.4,oci-mediatypes=true,push=true
+```
+
+Keep `PLUGIN_VERSION` in the Dockerfile in step with the source; the test
+fails if they differ.
 
 ### Building without internals
 

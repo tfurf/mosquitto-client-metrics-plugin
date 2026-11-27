@@ -118,5 +118,16 @@ if [ "$regs" = 0 ]; then echo "PASS disabled plugin registered no callbacks"; el
 pubs=$(docker exec "$NAME_OFF" mosquitto_sub -t "\$SYS/client-metrics/#" -C 1 -W 3 || true)
 if [ -z "$pubs" ]; then echo "PASS disabled plugin publishes nothing"; else echo "FAIL disabled plugin published: $pubs"; fail=1; fi
 
+echo "--- phase 5: OCI image annotations ---"
+label() { docker image inspect "$IMAGE" --format "{{ index .Config.Labels \"org.opencontainers.image.$1\" }}"; }
+plugin_version=$(docker logs "$NAME" 2>&1 | sed -n 's/.*client-metrics \([0-9][0-9.]*\): publishing.*/\1/p' | head -1)
+if [ -n "$plugin_version" ] && [ "$(label version)" = "$plugin_version" ]; then echo "PASS version label=$plugin_version matches plugin"; else echo "FAIL version label='$(label version)', plugin reports '$plugin_version'"; fail=1; fi
+for k in title description licenses base.name; do
+	v=$(label "$k")
+	if [ -n "$v" ] && [ "$v" != "<no value>" ]; then echo "PASS label $k=$v"; else echo "FAIL label $k missing"; fail=1; fi
+done
+case "$(label base.digest)" in sha256:*) echo "PASS base.digest pinned";; *) echo "FAIL base.digest not set"; fail=1;; esac
+case "$(label title)" in mosquitto-client-metrics) ;; *) echo "FAIL title overridden by base image: $(label title)"; fail=1;; esac
+
 [ $fail = 0 ] && echo "ALL PASSED"
 exit $fail
