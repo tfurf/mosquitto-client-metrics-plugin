@@ -58,7 +58,12 @@ plugin_opt_offline_retention 3600            # forget clients offline this long,
 plugin_opt_retain true                       # publish metrics retained
 plugin_opt_summary_top 10                    # clients listed in summary
 plugin_opt_log_drops true                    # NOTICE log line per dropping client
+plugin_opt_enabled true                      # false: load but collect nothing (zero overhead)
 ```
+
+Options are read at startup only. Mosquitto 2.1 doesn't reload plugins or
+`plugin_opt_*` on SIGHUP, so restart the broker to change them. The plugin
+keeps running, with its counters intact, across a SIGHUP.
 
 Use it as a global plugin. If you use `per_listener_settings true`, load it
 with `global_plugin`.
@@ -111,7 +116,9 @@ a healthy subscriber, a frozen QoS 1 subscriber, a frozen QoS 0 subscriber
 getting 64 KB messages, an offline persistent session (which then reconnects),
 and a client that hits a keepalive timeout. It checks each client's exact
 numbers. It also checks that the per-client drops add up to the broker's own
-global `$SYS/broker/publish/messages/dropped`.
+global `$SYS/broker/publish/messages/dropped`. Finally it sends the broker a
+SIGHUP, and starts a second broker with `plugin_opt_enabled false`
+(`test/mosquitto-disabled.conf`).
 
 ## Caveats
 

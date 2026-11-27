@@ -32,6 +32,10 @@
  *   plugin_opt_summary_top        number of clients in summary, default 10
  *   plugin_opt_log_drops          "true"/"false", log clients that dropped
  *                                 messages each interval, default true
+ *   plugin_opt_enabled            "true"/"false", default true. When false the
+ *                                 plugin loads but registers no callbacks.
+ *                                 Startup only: Mosquitto 2.1 does not reload
+ *                                 plugin options on SIGHUP.
  *
  * IMPORTANT: load this plugin BEFORE any authentication/ACL plugin. Mosquitto
  * stops calling ACL callbacks at the first plugin that returns a decision, so
@@ -197,6 +201,7 @@ struct plugin_data {
 	int summary_top;
 	bool retain;
 	bool log_drops;
+	bool enabled;
 	time_t next_publish;
 	struct client_entry *clients;
 	struct pending_route pending;
@@ -964,6 +969,7 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata, st
 	d->summary_top = 10;
 	d->retain = true;
 	d->log_drops = true;
+	d->enabled = true;
 
 	for(int i = 0; i < opt_count; i++){
 		const char *k = opts[i].key, *v = opts[i].value;
@@ -981,6 +987,8 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata, st
 			ok = parse_bool(v, &d->retain);
 		}else if(!strcmp(k, "log_drops")){
 			ok = parse_bool(v, &d->log_drops);
+		}else if(!strcmp(k, "enabled")){
+			ok = parse_bool(v, &d->enabled);
 		}else{
 			mosquitto_log_printf(MOSQ_LOG_ERR, PLUGIN_NAME ": unknown option '%s'.", k);
 			data_free(d);
@@ -1007,6 +1015,14 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata, st
 	*userdata = d;
 
 	mosquitto_plugin_set_info(identifier, PLUGIN_NAME, PLUGIN_VERSION);
+
+	/* Options are still validated above so a config typo is caught even while
+	 * disabled. With no callbacks registered the plugin costs nothing. */
+	if(!d->enabled){
+		mosquitto_log_printf(MOSQ_LOG_NOTICE, PLUGIN_NAME " " PLUGIN_VERSION
+				": disabled (plugin_opt_enabled false); no metrics will be collected.");
+		return MOSQ_ERR_SUCCESS;
+	}
 
 	REG(MOSQ_EVT_ACL_CHECK, cb_acl_check);
 	REG(MOSQ_EVT_MESSAGE_IN, cb_message_in);
