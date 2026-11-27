@@ -23,9 +23,27 @@ docker compose up --build          # broker on :1883 with the plugin loaded
 mosquitto_sub -t '$SYS/client-metrics/#' -v
 ```
 
-* `$SYS/client-metrics/summary` holds broker totals and `worst_clients`.
-* `$SYS/client-metrics/clients/<client id>` holds one JSON document per client
-  (retained). Any `+` or `#` in a client id is replaced with `_`.
+Each value is its own retained topic, so tools such as mqtt-exporter can read
+them directly:
+
+```
+$SYS/client-metrics/clients/slow-client/online                  true
+$SYS/client-metrics/clients/slow-client/totals/dropped          430
+$SYS/client-metrics/clients/slow-client/queues/out_queued       60
+$SYS/client-metrics/clients/slow-client/disconnect_reasons/keepalive_timeout 0
+$SYS/client-metrics/summary/clients_online                      3
+$SYS/client-metrics/summary/worst_clients/0/client_id           slow-client
+```
+
+* `…/clients/<client id>/…` holds per-client values. Any `+` or `#` in a client
+  id is replaced with `_`.
+* `…/summary/…` holds broker totals and `worst_clients`, ranked from 0.
+* With `plugin_opt_format json`, each base topic (`…/clients/<id>`,
+  `…/summary`) instead holds one JSON document with exactly this structure;
+  `both` publishes both. Booleans are `true`/`false`. A JSON `null` (e.g. no
+  username) has no topic.
+* Values that stop applying are cleared, for example `connected_for_s` once a
+  client goes offline.
 
 The broker also logs a NOTICE line whenever a client drops messages:
 
@@ -54,6 +72,7 @@ messages are dropped. It doesn't fix the client or link that's causing them.
 plugin /usr/lib/mosquitto_client_metrics.so
 plugin_opt_interval 10                       # seconds between publishes (default 10)
 plugin_opt_topic_prefix $SYS/client-metrics  # default
+plugin_opt_format topics                     # topics (default), json or both
 plugin_opt_offline_retention 3600            # forget clients offline this long, clearing their retained topic
 plugin_opt_retain true                       # publish metrics retained
 plugin_opt_summary_top 10                    # clients listed in summary
@@ -141,9 +160,12 @@ a healthy subscriber, a frozen QoS 1 subscriber, a frozen QoS 0 subscriber
 getting 64 KB messages, an offline persistent session (which then reconnects),
 and a client that hits a keepalive timeout. It checks each client's exact
 numbers. It also checks that the per-client drops add up to the broker's own
-global `$SYS/broker/publish/messages/dropped`. Finally it sends the broker a
-SIGHUP, and starts a second broker with `plugin_opt_enabled false`
-(`test/mosquitto-disabled.conf`).
+global `$SYS/broker/publish/messages/dropped`. That broker runs with
+`plugin_opt_format both`, and the test checks that each topic tree matches its
+JSON exactly, with no stale topics left behind. Finally it sends the broker a
+SIGHUP. It then starts two more brokers: one with `plugin_opt_enabled false`
+(`test/mosquitto-disabled.conf`), and one with the default format, topics only
+(`test/mosquitto-topics.conf`).
 
 ## Caveats
 

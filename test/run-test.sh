@@ -5,11 +5,12 @@ set -eu
 IMAGE=${IMAGE:-mosquitto-client-metrics:2.1.4}
 NAME=cm-test-$$
 NAME_OFF=cm-test-off-$$
+NAME_TOPICS=cm-test-topics-$$
 N=500
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 # shellcheck disable=SC2329 # invoked via trap
-cleanup() { docker rm -f "$NAME" "$NAME_OFF" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f "$NAME" "$NAME_OFF" "$NAME_TOPICS" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 docker run -d --name "$NAME" -v "$HERE/mosquitto-test.conf:/mosquitto/config/mosquitto.conf:ro" "$IMAGE" >/dev/null
@@ -128,6 +129,55 @@ for k in title description licenses base.name; do
 done
 case "$(label base.digest)" in sha256:*) echo "PASS base.digest pinned";; *) echo "FAIL base.digest not set"; fail=1;; esac
 case "$(label title)" in mosquitto-client-metrics) ;; *) echo "FAIL title overridden by base image: $(label title)"; fail=1;; esac
+
+echo "--- phase 6: topic tree mirrors JSON (plugin_opt_format both) ---"
+# All retained topics under <base>/# must be exactly the flattened JSON at
+# <base>: same paths, same values, nothing stale (e.g. connected_for_s of a
+# client that went offline). null => no retained topic.
+tree_matches_json() { # base topic
+	x mosquitto_sub -t "$1" -t "$1/#" -v -W 2 2>/dev/null | python3 -c "
+import json, sys
+base = sys.argv[1]
+doc, topics = None, {}
+for line in sys.stdin.read().splitlines():
+    t, _, v = line.partition(' ')
+    if t == base: doc = json.loads(v)
+    else: topics[t[len(base) + 1:]] = v
+def flat(o, path, out):
+    if isinstance(o, dict):
+        for k, v in o.items(): flat(v, path + [k], out)
+    elif isinstance(o, list):
+        for i, v in enumerate(o): flat(v, path + [str(i)], out)
+    elif o is not None:
+        out['/'.join(path)] = str(o).lower() if isinstance(o, bool) else str(o)
+    return out
+want = flat(doc, [], {}) if doc is not None else None
+if want is None: print('no JSON at', base); sys.exit(1)
+if want != topics:
+    for k in sorted(set(want) | set(topics)):
+        if want.get(k) != topics.get(k): print(' ', k, 'json=%r topic=%r' % (want.get(k), topics.get(k)))
+    sys.exit(1)
+print(len(topics), 'topics')
+" "$1"
+}
+for t in clients/fast-client clients/slow-client clients/offline-client clients/keepalive-client clients/publisher summary; do
+	if out=$(tree_matches_json "\$SYS/client-metrics/$t"); then echo "PASS $t: $out match JSON"; else echo "FAIL $t topic tree != JSON:"; echo "$out"; fail=1; fi
+done
+
+echo "--- phase 7: default format is topics only ---"
+docker run -d --name "$NAME_TOPICS" -v "$HERE/mosquitto-topics.conf:/mosquitto/config/mosquitto.conf:ro" "$IMAGE" >/dev/null
+sleep 1
+docker exec -d "$NAME_TOPICS" mosquitto_sub -i topics-sub -t 'test/#'
+sleep 3  # > plugin_opt_interval
+tx() { docker exec "$NAME_TOPICS" mosquitto_sub -t "\$SYS/client-metrics/$1" -C 1 -W 2 2>/dev/null || true; }
+v=$(tx clients/topics-sub/online)
+if [ "$v" = true ]; then echo "PASS clients/topics-sub/online=true"; else echo "FAIL clients/topics-sub/online='$v'"; fail=1; fi
+v=$(tx clients/topics-sub/totals/connects)
+if [ "$v" = 1 ]; then echo "PASS clients/topics-sub/totals/connects=1"; else echo "FAIL clients/topics-sub/totals/connects='$v'"; fail=1; fi
+v=$(tx summary/clients_online)
+if [ -n "$v" ]; then echo "PASS summary/clients_online=$v"; else echo "FAIL summary/clients_online missing"; fail=1; fi
+v=$(tx clients/topics-sub)$(tx summary)
+if [ -z "$v" ]; then echo "PASS no JSON documents in topics mode"; else echo "FAIL JSON published in topics mode: $v"; fail=1; fi
 
 [ $fail = 0 ] && echo "ALL PASSED"
 exit $fail

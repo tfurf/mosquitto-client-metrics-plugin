@@ -19,10 +19,13 @@
  * The internal struct layout is verified at runtime against the public
  * accessor functions; on mismatch these extras are disabled automatically.
  *
- * Metrics are published as one JSON document per client to
+ * Metrics are published per client under
  *   <topic_prefix>/clients/<client id>
- * plus a broker-wide summary (top offenders) at
+ * plus a broker-wide summary (top offenders) under
  *   <topic_prefix>/summary
+ * as one retained topic per value (e.g. .../clients/<id>/totals/dropped),
+ * as a JSON document at the base topic, or both. The topic tree mirrors the
+ * JSON structure exactly; array elements use their index as the topic level.
  *
  * Plugin options (all optional):
  *   plugin_opt_topic_prefix       default "$SYS/client-metrics"
@@ -32,6 +35,7 @@
  *   plugin_opt_summary_top        number of clients in summary, default 10
  *   plugin_opt_log_drops          "true"/"false", log clients that dropped
  *                                 messages each interval, default true
+ *   plugin_opt_format             "topics" (default), "json" or "both"
  *   plugin_opt_enabled            "true"/"false", default true. When false the
  *                                 plugin loads but registers no callbacks.
  *                                 Startup only: Mosquitto 2.1 does not reload
@@ -167,6 +171,8 @@ struct client_entry {
 	bool online;
 	bool dirty;               /* changed since last publish */
 	bool published;           /* has a retained message out there */
+	char *leaves;             /* leaf topics published last time ('\0'-separated) */
+	size_t leaves_len;
 	time_t first_seen;
 	time_t connected_at;
 	time_t offline_since;
@@ -202,6 +208,9 @@ struct plugin_data {
 	bool retain;
 	bool log_drops;
 	bool enabled;
+	int format;               /* FMT_JSON | FMT_TOPICS */
+	char *summary_leaves;
+	size_t summary_leaves_len;
 	time_t next_publish;
 	struct client_entry *clients;
 	struct pending_route pending;
@@ -397,6 +406,7 @@ static void entry_free(struct client_entry *e)
 	free(e->topic);
 	free(e->username);
 	free(e->address);
+	free(e->leaves);
 	free(e);
 }
 
@@ -640,94 +650,286 @@ static int cb_client_offline(int event, void *event_data, void *userdata)
 
 #define D(f) (e->c.f - e->prev.f)
 
+/* Output formats; "both" is FMT_JSON | FMT_TOPICS. */
+#define FMT_JSON   1
+#define FMT_TOPICS 2
+
+#define EM_MAX_DEPTH 8
+
+/* Walks a metrics document once and writes it as a JSON payload, as one
+ * retained topic per leaf (<base>/<key>/<key>...), or both. Driving both
+ * outputs from the same walk keeps the topic tree identical to the JSON. */
+struct emitter {
+	int mode;
+	const char *base;
+	struct buf json;
+	struct buf leaves;        /* '\0'-separated relative paths published */
+	char rel[256];            /* relative path of the current object */
+	size_t rel_len[EM_MAX_DEPTH];
+	bool is_array[EM_MAX_DEPTH];
+	bool first[EM_MAX_DEPTH];
+	int depth;
+	bool err;
+};
+
+static void topic_publish(const char *base, const char *rel, const char *payload, bool retain)
+{
+	size_t len = strlen(base) + 1 + strlen(rel) + 1;
+	char *topic = malloc(len);
+	if(!topic){
+		return;
+	}
+	snprintf(topic, len, "%s/%s", base, rel);
+	mosquitto_broker_publish_copy(NULL, topic, (int)strlen(payload), payload, 0, retain, NULL);
+	free(topic);
+}
+
+static void em_begin(struct emitter *em, int mode, const char *base)
+{
+	memset(em, 0, sizeof(*em));
+	em->mode = mode;
+	em->base = base;
+	em->first[0] = true;
+	if(mode & FMT_JSON){
+		buf_printf(&em->json, "{");
+	}
+}
+
+/* Append "/key" to the relative path; returns the previous length. */
+static size_t em_rel_push(struct emitter *em, const char *key)
+{
+	size_t saved = strlen(em->rel);
+	int n = snprintf(em->rel + saved, sizeof(em->rel) - saved, "%s%s", saved ? "/" : "", key);
+	if(n < 0 || (size_t)n >= sizeof(em->rel) - saved){
+		em->err = true;
+		em->rel[saved] = '\0';
+	}
+	return saved;
+}
+
+static void em_json_key(struct emitter *em, const char *key)
+{
+	if(!(em->mode & FMT_JSON)){
+		return;
+	}
+	if(!em->first[em->depth]){
+		buf_printf(&em->json, ",");
+	}
+	em->first[em->depth] = false;
+	if(!em->is_array[em->depth]){
+		buf_json_str(&em->json, key);
+		buf_printf(&em->json, ":");
+	}
+}
+
+static void em_open(struct emitter *em, const char *key, bool array)
+{
+	if(em->depth + 1 >= EM_MAX_DEPTH){
+		em->err = true;
+		return;
+	}
+	em_json_key(em, key);
+	if(em->mode & FMT_JSON){
+		buf_printf(&em->json, array ? "[" : "{");
+	}
+	size_t saved = em_rel_push(em, key);
+	em->depth++;
+	em->rel_len[em->depth] = saved;
+	em->is_array[em->depth] = array;
+	em->first[em->depth] = true;
+}
+
+static void em_close(struct emitter *em)
+{
+	if(em->depth == 0){
+		return;
+	}
+	if(em->mode & FMT_JSON){
+		buf_printf(&em->json, em->is_array[em->depth] ? "]" : "}");
+	}
+	em->rel[em->rel_len[em->depth]] = '\0';
+	em->depth--;
+}
+
+/* A leaf. json_literal is written as-is to JSON (NULL: write value as a JSON
+ * string). value NULL means JSON null and no topic. */
+static void em_leaf(struct emitter *em, const char *key, const char *json_literal, const char *value)
+{
+	em_json_key(em, key);
+	if(em->mode & FMT_JSON){
+		if(json_literal){
+			buf_printf(&em->json, "%s", json_literal);
+		}else{
+			buf_json_str(&em->json, value);
+		}
+	}
+	if((em->mode & FMT_TOPICS) && value){
+		size_t saved = em_rel_push(em, key);
+		if(!em->err){
+			topic_publish(em->base, em->rel, value, g_data->retain);
+			buf_printf(&em->leaves, "%s", em->rel);
+			buf_printf(&em->leaves, "%c", '\0');
+		}
+		em->rel[saved] = '\0';
+	}
+}
+
+static void em_u64(struct emitter *em, const char *key, uint64_t v)
+{
+	char s[24];
+	snprintf(s, sizeof(s), "%" PRIu64, v);
+	em_leaf(em, key, s, s);
+}
+
+static void em_i64(struct emitter *em, const char *key, long long v)
+{
+	char s[24];
+	snprintf(s, sizeof(s), "%lld", v);
+	em_leaf(em, key, s, s);
+}
+
+static void em_bool(struct emitter *em, const char *key, bool v)
+{
+	em_leaf(em, key, v ? "true" : "false", v ? "true" : "false");
+}
+
+static void em_str(struct emitter *em, const char *key, const char *v)
+{
+	em_leaf(em, key, v ? NULL : "null", v);
+}
+
+static bool leaves_contain(const char *list, size_t len, const char *path)
+{
+	for(size_t i = 0; i < len; i += strlen(list + i) + 1){
+		if(!strcmp(list + i, path)){
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Clear retained leaf topics published last time but not this time. */
+static void leaves_clear_stale(const char *base, const char *old, size_t old_len, const char *now, size_t now_len)
+{
+	for(size_t i = 0; old && i < old_len; i += strlen(old + i) + 1){
+		if(!now || !leaves_contain(now, now_len, old + i)){
+			topic_publish(base, old + i, "", true);
+		}
+	}
+}
+
+/* Publish the JSON document and remember the leaves for stale-clearing.
+ * leaves/leaves_len hold the previous run's leaf list and are replaced. */
+static bool em_finish(struct emitter *em, char **leaves, size_t *leaves_len)
+{
+	bool ok = !em->err && !em->json.err && !em->leaves.err;
+
+	if(em->mode & FMT_JSON){
+		buf_printf(&em->json, "}");
+		ok = ok && !em->json.err;
+		if(ok){
+			mosquitto_broker_publish_copy(NULL, em->base, (int)em->json.len, em->json.s, 0, g_data->retain, NULL);
+		}
+	}
+	if((em->mode & FMT_TOPICS) && g_data->retain && ok){
+		leaves_clear_stale(em->base, *leaves, *leaves_len, em->leaves.s, em->leaves.len);
+		free(*leaves);
+		*leaves = em->leaves.s;
+		*leaves_len = em->leaves.len;
+		em->leaves.s = NULL;
+	}
+	free(em->json.s);
+	free(em->leaves.s);
+	return ok;
+}
+
 static void publish_client(struct client_entry *e, time_t now)
 {
-	struct buf b = {0};
+	struct emitter em;
 
-	buf_printf(&b, "{\"client_id\":");
-	buf_json_str(&b, e->id);
-	buf_printf(&b, ",\"username\":");
-	buf_json_str(&b, e->username);
-	buf_printf(&b, ",\"address\":");
-	buf_json_str(&b, e->address);
-	buf_printf(&b, ",\"protocol_version\":%d,\"keepalive\":%d", e->protocol_version, e->keepalive);
-	buf_printf(&b, ",\"online\":%s", e->online ? "true" : "false");
-	buf_printf(&b, ",\"timestamp\":%lld", (long long)now);
+	em_begin(&em, g_data->format, e->topic);
+	em_str(&em, "client_id", e->id);
+	em_str(&em, "username", e->username);
+	em_str(&em, "address", e->address);
+	em_i64(&em, "protocol_version", e->protocol_version);
+	em_i64(&em, "keepalive", e->keepalive);
+	em_bool(&em, "online", e->online);
+	em_i64(&em, "timestamp", (long long)now);
 	if(e->online){
-		buf_printf(&b, ",\"connected_for_s\":%lld", (long long)(now - e->connected_at));
+		em_i64(&em, "connected_for_s", (long long)(now - e->connected_at));
 	}else if(e->offline_since){
-		buf_printf(&b, ",\"offline_for_s\":%lld", (long long)(now - e->offline_since));
+		em_i64(&em, "offline_for_s", (long long)(now - e->offline_since));
 	}
 
-	buf_printf(&b, ",\"totals\":{"
-			"\"connects\":%" PRIu64 ",\"disconnects\":%" PRIu64
-			",\"msgs_in\":%" PRIu64 ",\"bytes_in\":%" PRIu64
-			",\"msgs_out\":%" PRIu64 ",\"bytes_out\":%" PRIu64
-			",\"routed\":%" PRIu64 ",\"routed_offline\":%" PRIu64
-			",\"deferred\":%" PRIu64,
-			e->c.connects, e->c.disconnects,
-			e->c.msgs_in, e->c.bytes_in, e->c.msgs_out, e->c.bytes_out,
-			e->c.routed, e->c.routed_offline, e->c.deferred);
+	em_open(&em, "totals", false);
+	em_u64(&em, "connects", e->c.connects);
+	em_u64(&em, "disconnects", e->c.disconnects);
+	em_u64(&em, "msgs_in", e->c.msgs_in);
+	em_u64(&em, "bytes_in", e->c.bytes_in);
+	em_u64(&em, "msgs_out", e->c.msgs_out);
+	em_u64(&em, "bytes_out", e->c.bytes_out);
+	em_u64(&em, "routed", e->c.routed);
+	em_u64(&em, "routed_offline", e->c.routed_offline);
+	em_u64(&em, "deferred", e->c.deferred);
 #ifdef CM_WITH_INTERNALS
 	if(internals_ok()){
-		buf_printf(&b, ",\"dropped\":%" PRIu64 ",\"dropped_offline\":%" PRIu64
-				",\"skipped_offline_qos0\":%" PRIu64,
-				e->c.dropped, e->c.dropped_offline, e->c.skipped_offline);
+		em_u64(&em, "dropped", e->c.dropped);
+		em_u64(&em, "dropped_offline", e->c.dropped_offline);
+		em_u64(&em, "skipped_offline_qos0", e->c.skipped_offline);
 	}
 #endif
-	buf_printf(&b, "}");
+	em_close(&em);
 
-	buf_printf(&b, ",\"interval\":{\"seconds\":%d"
-			",\"msgs_in\":%" PRIu64 ",\"msgs_out\":%" PRIu64
-			",\"routed\":%" PRIu64 ",\"deferred\":%" PRIu64
-			",\"disconnects\":%" PRIu64,
-			g_data->interval, D(msgs_in), D(msgs_out), D(routed), D(deferred), D(disconnects));
+	em_open(&em, "interval", false);
+	em_i64(&em, "seconds", g_data->interval);
+	em_u64(&em, "msgs_in", D(msgs_in));
+	em_u64(&em, "msgs_out", D(msgs_out));
+	em_u64(&em, "routed", D(routed));
+	em_u64(&em, "deferred", D(deferred));
+	em_u64(&em, "disconnects", D(disconnects));
 #ifdef CM_WITH_INTERNALS
 	if(internals_ok()){
-		buf_printf(&b, ",\"dropped\":%" PRIu64 ",\"dropped_offline\":%" PRIu64,
-				D(dropped), D(dropped_offline));
+		em_u64(&em, "dropped", D(dropped));
+		em_u64(&em, "dropped_offline", D(dropped_offline));
 	}
 #endif
-	buf_printf(&b, "}");
+	em_close(&em);
 
-	buf_printf(&b, ",\"disconnect_reasons\":{");
+	em_open(&em, "disconnect_reasons", false);
 	for(int i = 0; i < DC_COUNT; i++){
-		buf_printf(&b, "%s\"%s\":%" PRIu64, i ? "," : "", dc_names[i], e->dc[i]);
+		em_u64(&em, dc_names[i], e->dc[i]);
 	}
-	buf_printf(&b, "}");
+	em_close(&em);
 	if(e->last_reason >= 0){
-		buf_printf(&b, ",\"last_disconnect\":{\"reason\":\"%s\",\"code\":%d}",
-				dc_names[classify_reason(e->last_reason)], e->last_reason);
+		em_open(&em, "last_disconnect", false);
+		em_str(&em, "reason", dc_names[classify_reason(e->last_reason)]);
+		em_i64(&em, "code", e->last_reason);
+		em_close(&em);
 	}
 
 #ifdef CM_WITH_INTERNALS
 	if(internals_ok()){
 		struct mosquitto *ctx = mosquitto_client(e->id);
 		if(ctx){
-			buf_printf(&b, ",\"queues\":{"
-					"\"out_inflight\":%d,\"out_inflight_bytes\":%ld"
-					",\"out_queued\":%d,\"out_queued_bytes\":%ld"
-					",\"out_inflight_max\":%u"
-					",\"in_inflight\":%d,\"in_queued\":%d"
-					",\"socket_packets_pending\":%d"
-					",\"dropping\":%s,\"broker_dropped_in\":%" PRIu64 "}",
-					ctx->msgs_out.inflight_count, ctx->msgs_out.inflight_bytes,
-					ctx->msgs_out.queued_count, ctx->msgs_out.queued_bytes,
-					(unsigned)ctx->msgs_out.inflight_maximum,
-					ctx->msgs_in.inflight_count, ctx->msgs_in.queued_count,
-					ctx->out_packet_count,
-					ctx->is_dropping ? "true" : "false",
-					ctx->stats.messages_dropped);
+			em_open(&em, "queues", false);
+			em_i64(&em, "out_inflight", ctx->msgs_out.inflight_count);
+			em_i64(&em, "out_inflight_bytes", ctx->msgs_out.inflight_bytes);
+			em_i64(&em, "out_queued", ctx->msgs_out.queued_count);
+			em_i64(&em, "out_queued_bytes", ctx->msgs_out.queued_bytes);
+			em_i64(&em, "out_inflight_max", ctx->msgs_out.inflight_maximum);
+			em_i64(&em, "in_inflight", ctx->msgs_in.inflight_count);
+			em_i64(&em, "in_queued", ctx->msgs_in.queued_count);
+			em_i64(&em, "socket_packets_pending", ctx->out_packet_count);
+			em_bool(&em, "dropping", ctx->is_dropping);
+			em_u64(&em, "broker_dropped_in", ctx->stats.messages_dropped);
+			em_close(&em);
 		}
 	}
 #endif
-	buf_printf(&b, "}");
 
-	if(!b.err && b.s){
-		mosquitto_broker_publish_copy(NULL, e->topic, (int)b.len, b.s, 0, g_data->retain, NULL);
+	if(em_finish(&em, &e->leaves, &e->leaves_len)){
 		e->published = true;
 	}
-	free(b.s);
 }
 
 /* Summary ranking: messages lost first (exact drops if available, otherwise
@@ -761,7 +963,6 @@ static int cmp_score(const void *a, const void *b)
 
 static void publish_summary(time_t now)
 {
-	struct buf b = {0};
 	struct client_entry *e, *tmp;
 	unsigned count = HASH_COUNT(g_data->clients);
 	unsigned online = 0;
@@ -787,44 +988,49 @@ static void publish_summary(time_t now)
 		qsort(arr, n, sizeof(*arr), cmp_score);
 	}
 
-	buf_printf(&b, "{\"timestamp\":%lld,\"plugin_version\":\"%s\"", (long long)now, PLUGIN_VERSION);
+	struct emitter em;
+	em_begin(&em, g_data->format, g_data->summary_topic);
+	em_i64(&em, "timestamp", (long long)now);
+	em_str(&em, "plugin_version", PLUGIN_VERSION);
 #ifdef CM_WITH_INTERNALS
-	buf_printf(&b, ",\"exact_drop_counts\":%s", internals_ok() ? "true" : "false");
+	em_bool(&em, "exact_drop_counts", internals_ok());
 #else
-	buf_printf(&b, ",\"exact_drop_counts\":false");
+	em_bool(&em, "exact_drop_counts", false);
 #endif
-	buf_printf(&b, ",\"clients_tracked\":%u,\"clients_online\":%u", count, online);
-	buf_printf(&b, ",\"routed\":%" PRIu64 ",\"deferred\":%" PRIu64, routed, deferred);
+	em_u64(&em, "clients_tracked", count);
+	em_u64(&em, "clients_online", online);
+	em_u64(&em, "routed", routed);
+	em_u64(&em, "deferred", deferred);
 #ifdef CM_WITH_INTERNALS
 	if(internals_ok()){
-		buf_printf(&b, ",\"dropped\":%" PRIu64, dropped);
+		em_u64(&em, "dropped", dropped);
 	}
 #endif
-	buf_printf(&b, ",\"keepalive_timeouts\":%" PRIu64 ",\"conn_lost\":%" PRIu64, keepalive, lost);
-	buf_printf(&b, ",\"worst_clients\":[");
+	em_u64(&em, "keepalive_timeouts", keepalive);
+	em_u64(&em, "conn_lost", lost);
+	em_open(&em, "worst_clients", true);
 	for(unsigned i = 0; i < n && i < (unsigned)g_data->summary_top; i++){
+		char idx[12];
 		e = arr[i];
-		buf_printf(&b, "%s{\"client_id\":", i ? "," : "");
-		buf_json_str(&b, e->id);
-		buf_printf(&b, ",\"online\":%s,\"deferred\":%" PRIu64
-				",\"keepalive_timeouts\":%" PRIu64 ",\"conn_lost\":%" PRIu64,
-				e->online ? "true" : "false", e->c.deferred,
-				e->dc[DC_KEEPALIVE], e->dc[DC_CONN_LOST]);
+		snprintf(idx, sizeof(idx), "%u", i);
+		em_open(&em, idx, false);
+		em_str(&em, "client_id", e->id);
+		em_bool(&em, "online", e->online);
+		em_u64(&em, "deferred", e->c.deferred);
+		em_u64(&em, "keepalive_timeouts", e->dc[DC_KEEPALIVE]);
+		em_u64(&em, "conn_lost", e->dc[DC_CONN_LOST]);
 #ifdef CM_WITH_INTERNALS
 		if(internals_ok()){
-			buf_printf(&b, ",\"dropped\":%" PRIu64 ",\"dropped_offline\":%" PRIu64,
-					e->c.dropped, e->c.dropped_offline);
+			em_u64(&em, "dropped", e->c.dropped);
+			em_u64(&em, "dropped_offline", e->c.dropped_offline);
 		}
 #endif
-		buf_printf(&b, "}");
+		em_close(&em);
 	}
-	buf_printf(&b, "]}");
+	em_close(&em);
 	free(arr);
 
-	if(!b.err && b.s){
-		mosquitto_broker_publish_copy(NULL, g_data->summary_topic, (int)b.len, b.s, 0, g_data->retain, NULL);
-	}
-	free(b.s);
+	em_finish(&em, &g_data->summary_leaves, &g_data->summary_leaves_len);
 }
 
 static void publish_all(time_t now)
@@ -837,7 +1043,10 @@ static void publish_all(time_t now)
 				&& g_data->offline_retention >= 0
 				&& now - e->offline_since > g_data->offline_retention){
 			if(e->published && g_data->retain){
-				mosquitto_broker_publish_copy(NULL, e->topic, 0, NULL, 0, true, NULL);
+				if(g_data->format & FMT_JSON){
+					mosquitto_broker_publish_copy(NULL, e->topic, 0, NULL, 0, true, NULL);
+				}
+				leaves_clear_stale(e->topic, e->leaves, e->leaves_len, NULL, 0);
 			}
 			if(g_data->pending.entry == e){
 				g_data->pending.active = false;
@@ -938,6 +1147,7 @@ static void data_free(struct plugin_data *d)
 	}
 	free(d->prefix);
 	free(d->summary_topic);
+	free(d->summary_leaves);
 	free(d);
 }
 
@@ -970,6 +1180,7 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata, st
 	d->retain = true;
 	d->log_drops = true;
 	d->enabled = true;
+	d->format = FMT_TOPICS;
 
 	for(int i = 0; i < opt_count; i++){
 		const char *k = opts[i].key, *v = opts[i].value;
@@ -987,6 +1198,16 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **userdata, st
 			ok = parse_bool(v, &d->retain);
 		}else if(!strcmp(k, "log_drops")){
 			ok = parse_bool(v, &d->log_drops);
+		}else if(!strcmp(k, "format")){
+			if(!strcmp(v, "topics")){
+				d->format = FMT_TOPICS;
+			}else if(!strcmp(v, "json")){
+				d->format = FMT_JSON;
+			}else if(!strcmp(v, "both")){
+				d->format = FMT_JSON | FMT_TOPICS;
+			}else{
+				ok = false;
+			}
 		}else if(!strcmp(k, "enabled")){
 			ok = parse_bool(v, &d->enabled);
 		}else{
